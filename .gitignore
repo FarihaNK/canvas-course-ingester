@@ -1,0 +1,26 @@
+# Secrets
+.env
+
+# Generated data: course content is copyrighted and discussions contain
+# other students' posts, so none of it belongs in version control.
+canvas_data.db
+canvas_data.db-journal
+ingested/
+notes/
+archived/
+downloaded_files/
+converted/
+
+# Logs
+*.log
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
