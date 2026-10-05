@@ -3,7 +3,21 @@
 Turns your Canvas courses into local markdown files with AI study notes, and
 can message you on Telegram about what's new and what's due.
 
-> Runs only when you run it. No scheduler, no background process.
+> Run it by hand, or set up a cron job on your computer to run it on a schedule.
+
+<details>
+<summary>Example cron job</summary>
+
+Run `crontab -e` and add (use your real path):
+
+```
+0 6 * * *  cd /path/to/repo && ./venv/bin/python canvas_sync.py >> sync.log 2>&1
+0 7 * * *  cd /path/to/repo && ./venv/bin/python notifier.py   >> notify.log 2>&1
+```
+
+Sync daily at 6, notify at 7.
+
+</details>
 
 ## What it does
 
@@ -103,33 +117,3 @@ Built-in safety:
 - **First run doesn't flood you.** Existing content is marked as seen. Use
   `--send-existing` if you want the backlog.
 - **Stops early on a bad token.** Three failed sends in a row end the run.
-
-## One-off files
-
-```bash
-python manual_summarize.py --course 12345 path/to/file.pdf
-```
-
-Writes the text and a note to `ingested/12345/manual/` and `notes/12345/manual/`.
-No database, no Canvas calls.
-
-## Limitations
-
-- Nested discussion replies are skipped (top-level only).
-- Some courses block the Quizzes API or the Files tab (404/403). Those are
-  logged and skipped; everything else still syncs.
-- Links behind a login, paywall or JavaScript can't be fetched.
-- Images and spreadsheets are saved but get no text or notes.
-- The notifier is only as current as your last sync.
-
-## Privacy
-
-- Everything is stored on your machine.
-- Discussions can contain other students' posts, so keep the database and
-  folders private. `.gitignore` already excludes them, along with `.env`.
-- Text is sent to Anthropic for summaries. Telegram messages go only to your
-  own chat.
-
-## More
-
-[DESIGN.md](DESIGN.md) covers the architecture, the data, and how each script works.

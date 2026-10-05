@@ -1,6 +1,6 @@
 # Design
 
-**TL;DR:** Two scripts that you run by hand. They share one SQLite database.
+**TL;DR:** Two scripts, run by hand or from cron. They share one SQLite database.
 `canvas_sync.py` pulls Canvas content into files and notes. `notifier.py`
 reads the database and sends Telegram messages.
 
