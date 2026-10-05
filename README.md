@@ -132,4 +132,4 @@ No database, no Canvas calls.
 
 ## More
 
-[DESIGN.md](DESIGN.md) explains how it works and why.
+[DESIGN.md](DESIGN.md) covers the architecture, the data, and how each script works.
