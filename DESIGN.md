@@ -66,7 +66,7 @@ write a Claude study note to `notes/` if there's enough text.
 | Files tab | Skips any file already seen, so it only catches true orphans |
 | Quizzes | Graded quizzes come via assignments. The quizzes endpoint adds the rest, skipping any with an `assignment_id` to avoid duplicates |
 | Discussion replies | Top-level only, to avoid pulling in long nested threads |
-| External links | Fetched without Canvas credentials. Capped at 100 per course per run. Failures are recorded so they aren't retried every run |
+| External links | Fetched without Canvas credentials, and only from public web addresses: localhost, private networks and cloud-metadata IPs are blocked, and every redirect is re-checked. Capped at 100 per course per run. Failures are recorded so they aren't retried every run |
 | Backfill | Writes a copy or note if the content changed **or** the file is missing on disk |
 | Timeouts | 30s on Canvas calls and downloads, 15s on external pages. A failing step logs a warning and the sync continues |
 

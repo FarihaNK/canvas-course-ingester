@@ -34,11 +34,13 @@ import io
 import os
 import re
 import json
+import socket
 import hashlib
 import sqlite3
 import datetime
+import ipaddress
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -59,6 +61,7 @@ PLAIN_TEXT_SUFFIXES = {".txt", ".md"}
 
 # Safety cap on how many external links get fetched per course per run.
 MAX_EXTERNAL_LINKS_PER_COURSE = 100
+MAX_REDIRECTS = 5
 
 HEADERS = {"Authorization": f"Bearer {CANVAS_API_TOKEN}"}
 SESSION = requests.Session()
@@ -404,15 +407,53 @@ def find_external_links(html):
     return cleaned
 
 
+def is_public_url(url):
+    """True only for http(s) URLs whose host resolves exclusively to public
+    internet addresses. Course content (including other students' posts) can
+    contain links to localhost, your home network, or cloud metadata
+    endpoints; those must never be fetched on your behalf."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError):
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        except ValueError:
+            return False
+        ip = getattr(ip, "ipv4_mapped", None) or ip
+        if not ip.is_global:
+            return False
+    return True
+
+
+def get_public(url):
+    """GET that checks every redirect hop, not just the first URL -- a public
+    page can otherwise redirect to an internal address."""
+    for _ in range(MAX_REDIRECTS + 1):
+        if not is_public_url(url):
+            raise ValueError("blocked: not a public web address")
+        resp = requests.get(
+            url, timeout=15, allow_redirects=False,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; canvas-sync/1.0)"},
+        )
+        if not resp.is_redirect:
+            return resp
+        url = urljoin(url, resp.headers["Location"])
+    raise ValueError("too many redirects")
+
+
 def fetch_external_page(url):
     """Fetches an external (non-Canvas) URL and extracts readable text.
     Deliberately uses a bare, unauthenticated request -- never SESSION --
-    so the Canvas API bearer token is never sent to a third-party site."""
+    so the Canvas API bearer token is never sent to a third-party site, and
+    only to public addresses (see is_public_url)."""
     try:
-        resp = requests.get(
-            url, timeout=15,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; canvas-sync/1.0)"},
-        )
+        resp = get_public(url)
         resp.raise_for_status()
         if len(resp.content) > 20_000_000:
             print(f"  [warn] skipping {url}: response too large")
