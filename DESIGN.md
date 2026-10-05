@@ -2,17 +2,23 @@
 
 ## 1. Purpose & scope
 
-On manual command, ingest everything reachable from a Canvas
-course — syllabus, announcements, assignments, quizzes, modules (and the
-files/pages inside them), the Files tab, discussions and their top-level
-replies, all attached files, and any external website/reading link found
-in any of that content — into local, inspectable files and a database.
-For each piece of content, also generate a short jot-note summary.
+Two independent, manually-run scripts that share a SQLite file:
 
-**Explicit non-goal:** this system never sends anything anywhere (no
-notifications, no messaging integration) and never runs on a schedule —
-only when invoked by hand. Its summaries are digests of existing
-material; it never drafts or generates content for submission.
+1. **`canvas_sync.py`** ingests everything reachable from a Canvas
+   course — syllabus, announcements, assignments, quizzes, modules (and
+   the files/pages inside them), the Files tab, discussions and their
+   top-level replies, all attached files, and any external
+   website/reading link found in any of that content — into local,
+   inspectable files and a database, and writes a short jot-note summary
+   for each piece of content.
+2. **`notifier.py`** reads that data and sends Telegram messages: new
+   content notes, exam/quiz countdowns with review checklists, and
+   assignment work-pacing reminders.
+
+**Explicit non-goals:** neither script runs on a schedule — only when
+invoked by hand. Generated text is always a digest or a *schedule*
+(what to work on and when); the system never drafts or generates content
+for submission.
 
 ## 2. Requirements
 
@@ -23,13 +29,18 @@ material; it never drafts or generates content for submission.
 | R3 | Follow every external (non-Canvas) link found in any synced content and ingest that page's content too | "website content" / "readings" |
 | R4 | Run only when manually invoked | No scheduler, cron job, or background process of any kind |
 | R5 | Detect *new* vs *changed* vs *unchanged* content, and re-run cheaply | Avoid redundant downloads/API calls/summaries on unchanged content |
-| R6 | Generate a short jot-note summary for each new/changed piece of content with enough text to summarize | Written to disk only — never sent anywhere |
+| R6 | Generate a short jot-note summary for each new/changed piece of content with enough text to summarize | Written to disk by `canvas_sync.py`; only `notifier.py` ever sends anything |
 | R7 | Never leak the Canvas API token to an external site | External link fetches must not reuse the authenticated Canvas session |
+| R8 | Push notifications for new content, upcoming quizzes/exams, and assignment milestones | Telegram; opt-in (needs a bot token), `--dry-run` previews |
+| R9 | Never send a duplicate notification, and never flood on first run | Idempotent across repeated runs; existing content is baselined, not blasted |
+| R10 | The two scripts must be independently replaceable | Coupled only through the database schema and the `notes/` folder |
 
 ## 3. High-level architecture
 
-A single process, run by hand, that mirrors Canvas (plus anything linked
-from it) into local files and a database.
+Two processes, each run by hand, connected only through a shared
+database file and the `notes/` folder. Neither imports the other's
+logic (`notifier.py` reuses a few small helpers from `canvas_sync.py`
+such as the Claude wrapper and filename slugging).
 
 ```
 Canvas --> [canvas_sync.py] --> canvas_data.db (SQLite)
@@ -38,6 +49,10 @@ Canvas --> [canvas_sync.py] --> canvas_data.db (SQLite)
        |                    +--> notes/<course_id>/<category>/      (Claude jot-note summaries)
        v
 External links found in synced content --> fetched directly (unauthenticated) --> same two trees, category=readings
+
+canvas_data.db + notes/ --> [notifier.py] --> Telegram
+                                  |
+                                  +--> Claude (review checklists, milestone plans)
 ```
 
 - **Compute:** run manually from the command line. No cron, no CI
@@ -46,24 +61,41 @@ External links found in synced content --> fetched directly (unauthenticated) --
   its content hash. Single writer, zero ops overhead, trivially
   portable/inspectable (`sqlite3 canvas_data.db "select ..."`).
 - **Secrets:** `.env` file, loaded via `python-dotenv`, holding the
-  Canvas API token and an Anthropic API key (for summaries). Never in
-  source control; `.env.example` documents the required keys without
-  values.
+  Canvas API token, an Anthropic API key, and (for the notifier) a
+  Telegram bot token and chat ID. Never in source control;
+  `.env.example` documents the required keys without values.
 - **File storage:** `ingested/<course_id>/<category>/` for raw +
   converted content, `notes/<course_id>/<category>/` for summaries.
   `<category>` ∈ `syllabus, announcements, assignments, quizzes,
   modules, files, discussions, readings, manual`.
 - **External services:** Canvas REST API (personal access token),
-  Anthropic API (summaries), and arbitrary external URLs found in
+  Anthropic API (summaries, review checklists, milestone plans),
+  Telegram Bot API (notifications), and arbitrary external URLs found in
   course content (unauthenticated fetches only — see R7 below).
 
 ## 4. Data model
 
-Single SQLite file, two tables. Full DDL in `schema.sql`.
+Single SQLite file. `courses` and `items` are defined in `schema.sql`
+and written by `canvas_sync.py`. `notifications` and `milestones` are
+created by `notifier.py` itself on first run (`CREATE TABLE IF NOT
+EXISTS`), so the sync script and its schema stay usable without the
+notifier.
 
 ```
-courses ----1:N---- items
+courses ----1:N---- items ----1:N---- notifications
+                       |
+                       1:N
+                       |
+                    milestones
 ```
+
+- **`notifications`** — append-only log of every message sent (or
+  baselined), keyed by `(item_id, kind)` with a `UNIQUE` constraint.
+  This is the R9 idempotency mechanism: "have I sent this kind of
+  message for this item?" is one indexed lookup.
+- **`milestones`** — generated pacing plans for assignments. Kept
+  separate from `items` because they're notifier-generated, not Canvas
+  data, so `items` stays a faithful mirror of what Canvas returned.
 
 - **`courses`** — one row per active enrollment.
 - **`items`** — one row per piece of content, whatever its origin:
@@ -150,18 +182,53 @@ students' posts. This stays local to the SQLite file and local folders,
 and is sent externally only to Anthropic (for summarization) and to
 whatever external site a reading link points to (for that link's own
 public page content) — never re-published, aggregated, or sent anywhere
-else.
+else. The notifier's new-content messages cover announcements, files,
+discussion topics and module items, not individual discussion replies,
+and go only to your own Telegram chat.
 
 **Security (R7):** `fetch_external_page()` uses a plain `requests.get()`,
 never the Canvas-authenticated `SESSION` object, specifically so the
 Canvas API bearer token in `SESSION`'s headers is never sent to a
 third-party host reachable from course content.
 
-## 6. Extension points
+## 6. Module design — `notifier.py`
+
+**Responsibility:** read the database and `notes/`, decide what's newly
+worth telling the user, send it, and record that it was sent. Never
+touches the Canvas API.
+
+| Component | Real functions | Responsibility |
+|---|---|---|
+| `NotificationLog` | `already_sent()`, `mark_sent()` | Wraps the `notifications` table. Every send path checks `already_sent()` *before* generating content (so no Claude call is wasted on something that won't be sent) and calls `mark_sent()` after the send succeeds, so a failed send is retried next run. |
+| `TelegramSender` | `send_telegram()` | The only delivery mechanism. Isolated in one function so swapping the channel (email, Discord) touches one call site. Sends plain text with no `parse_mode`, since titles and summaries come from Canvas/Claude and a stray `*` or `_` would make Telegram reject a Markdown message. |
+| `NewContentPipeline` | `notify_new_content()`, `read_note()` | R8. For announcements, files, discussions and module items, sends the jot-note `canvas_sync.py` already wrote (found by the same slug the sync used), rather than paying for a second summarization. Items with no note are skipped. |
+| `ExamCountdownPipeline` | `notify_exam_countdowns()`, `build_review_notes()` | R8. For quizzes/calendar events due within the lookahead window, fires at 10/5/2/1 days out, each threshold logged as its own `kind` so all four reminders are independent. The review checklist is generated from the course's most recently synced material, not generic advice. |
+| `MilestonePipeline` | `notify_assignment_milestones()`, `ensure_milestone_plan()`, `check_due_milestones()` | R8. Generate-once: if an assignment has no milestone rows, ask Claude for a JSON pacing plan, persist it, and announce it. Check-daily: if today matches a stored milestone date, send that reminder. |
+
+**First-run baseline (R9):** if the `notifications` table is empty, the
+notifier marks everything already synced as seen instead of sending it —
+otherwise the first run would send one message per item ever ingested.
+`--send-existing` overrides this. `--dry-run` prints what *would* be sent
+and makes no Claude calls and no sends.
+
+**Content-safety boundary:** `ensure_milestone_plan()`'s prompt asks for
+a pacing plan, not assignment content, and requests a JSON array of
+`{days_before_due, label, detail}` where `detail` describes an
+*activity* ("outline your argument"), never an answer. No code path takes
+assignment text and asks an LLM to produce submittable output; adding
+one would be new code, not a flag flip.
+
+**Failure handling:** a Telegram error raises and aborts that run
+*before* `mark_sent()`, so nothing is recorded as sent that wasn't. An
+unparseable milestone plan is logged and skipped.
+
+## 7. Extension points
 
 - **Query the data:** anything downstream can read `canvas_data.db`
   directly, or just walk `ingested/`/`notes/` on disk — the schema and
   folder layout are the only contracts.
+- **Swap the delivery channel:** replace `send_telegram()` in
+  `notifier.py`. Nothing else changes.
 - **Add a new Canvas resource:** add one `sync_*` function following the
   existing pattern (upsert via `ingest_text_item`/`ingest_file`, pick a
   category), no schema change needed.
