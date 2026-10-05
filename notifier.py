@@ -114,6 +114,12 @@ def send_telegram(text):
         raise requests.HTTPError(f"Telegram rejected message: {resp.status_code} {resp.text}")
 
 
+def redact(text):
+    """Telegram puts the bot token in the request URL, and requests echoes the
+    URL in network errors -- keep it out of terminal output and log files."""
+    return text.replace(TELEGRAM_BOT_TOKEN, "<token>") if TELEGRAM_BOT_TOKEN else text
+
+
 def deliver(conn, item_id, kind, msg):
     """Sends one message and logs it. A failed send is reported and left
     unlogged, so the next run retries it; repeated failures stop the run."""
@@ -122,7 +128,7 @@ def deliver(conn, item_id, kind, msg):
         send_telegram(msg)
     except requests.RequestException as e:
         _consecutive_failures += 1
-        print(f"  [warn] could not send {kind} for {item_id}: {e}")
+        print(f"  [warn] could not send {kind} for {item_id}: {redact(str(e))}")
         if _consecutive_failures >= MAX_CONSECUTIVE_SEND_FAILURES:
             sys.exit("Too many failed sends in a row -- check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.")
         return False
