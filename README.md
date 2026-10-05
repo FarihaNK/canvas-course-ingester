@@ -37,7 +37,7 @@ Telegram chat; nothing else leaves your machine.
   endpoint (a disabled feature, a permissions error) logs a warning and the
   rest of the run continues.
 - **Telegram notifications (optional).**
-  - *New content:* the study note for each new announcement, file,
+  - *New content:* a short summary of each new announcement, file,
     discussion or module item.
   - *Quiz/exam countdowns:* a review checklist at 10, 5, 2 and 1 days out,
     built from that course's recent material.
@@ -46,7 +46,9 @@ Telegram chat; nothing else leaves your machine.
     when), never the assignment content itself.
 - **Never repeats itself.** Every message is logged, and the first run marks
   existing content as already seen instead of flooding you. `--dry-run`
-  previews everything without sending.
+  previews everything without sending. A failed send isn't logged, so it's
+  retried next run, and the run stops after three failures in a row (usually a
+  bad token) rather than spending API credit on messages it can't deliver.
 
 ## How it works
 
@@ -58,7 +60,7 @@ Canvas API --> canvas_sync.py --> SQLite (canvas_data.db)    what was seen, cont
 
 Links found in course content --> fetched without Canvas credentials --> category "readings"
 
-canvas_data.db + notes/ --> notifier.py --> Telegram         (optional, separate command)
+canvas_data.db --> notifier.py --> Telegram                  (optional, separate command)
 ```
 
 `<category>` is one of `syllabus`, `announcements`, `assignments`, `quizzes`,
@@ -96,11 +98,9 @@ notes/12345/
 - **Files are filed by where they were found.** A file attached to an
   assignment lands under `assignments/`; the same file in a module also lands
   under `modules/`. The Files-tab walk only keeps genuine orphans.
-- **Loosely coupled scripts.** The notifier shares only the database and the
-  `notes/` folder with the sync, so either can be replaced (e.g. email instead
-  of Telegram) without touching the other. It reuses the notes the sync
-  already wrote instead of summarizing everything twice, and creates its own
-  tables so the sync works without it.
+- **Loosely coupled scripts.** The notifier shares only the database schema
+  with the sync and imports nothing from it, so either can be replaced (e.g.
+  email instead of Telegram) without touching the other.
 
 ## Quick start
 
@@ -174,7 +174,7 @@ This extracts the text and writes a note under `ingested/12345/manual/` and
 canvas_sync.py        # the ingester: API client, extraction, sync logic, notes
 notifier.py           # optional Telegram notifications, reads the sync's output
 manual_summarize.py   # standalone summarizer for local files
-schema.sql            # SQLite schema for the sync (courses, items)
+schema.sql            # SQLite schema (courses, items, notifications, milestones)
 DESIGN.md             # architecture and design rationale
 .env.example          # configuration template
 ```

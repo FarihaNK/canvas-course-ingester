@@ -1,5 +1,6 @@
 -- schema.sql
--- Database written by canvas_sync.py.
+-- Shared database. canvas_sync.py writes `courses` and `items`. notifier.py
+-- reads those and writes `notifications` and `milestones`.
 
 CREATE TABLE IF NOT EXISTS courses (
     id          INTEGER PRIMARY KEY,     -- Canvas course id
@@ -37,3 +38,28 @@ CREATE TABLE IF NOT EXISTS items (
 
 CREATE INDEX IF NOT EXISTS idx_items_course_type ON items(course_id, type);
 CREATE INDEX IF NOT EXISTS idx_items_due_at ON items(due_at);
+
+-- Every message the notifier has sent, so it never repeats itself.
+-- kind examples: 'new_content', 'exam_countdown:10d', 'exam_countdown:1d',
+-- 'milestone_plan_created', 'assignment_milestone:<milestone id>'
+CREATE TABLE IF NOT EXISTS notifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id     TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    sent_at     TEXT NOT NULL,
+    message     TEXT,
+    UNIQUE(item_id, kind),
+    FOREIGN KEY (item_id) REFERENCES items(id)
+);
+
+-- Generated milestone plans for assignments, created once per assignment.
+-- Kept separate from `items` since these are notifier-generated, not
+-- pulled from Canvas.
+CREATE TABLE IF NOT EXISTS milestones (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id        TEXT NOT NULL,        -- the assignment this belongs to
+    milestone_date TEXT NOT NULL,
+    label          TEXT NOT NULL,        -- e.g. "Outline + sources"
+    detail         TEXT,                 -- what to actually do that day
+    FOREIGN KEY (item_id) REFERENCES items(id)
+);

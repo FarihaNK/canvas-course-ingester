@@ -33,14 +33,12 @@ for submission.
 | R7 | Never leak the Canvas API token to an external site | External link fetches must not reuse the authenticated Canvas session |
 | R8 | Push notifications for new content, upcoming quizzes/exams, and assignment milestones | Telegram; opt-in (needs a bot token), `--dry-run` previews |
 | R9 | Never send a duplicate notification, and never flood on first run | Idempotent across repeated runs; existing content is baselined, not blasted |
-| R10 | The two scripts must be independently replaceable | Coupled only through the database schema and the `notes/` folder |
+| R10 | The two scripts must be independently replaceable | Coupled only through the database schema; neither imports the other |
 
 ## 3. High-level architecture
 
 Two processes, each run by hand, connected only through a shared
-database file and the `notes/` folder. Neither imports the other's
-logic (`notifier.py` reuses a few small helpers from `canvas_sync.py`
-such as the Claude wrapper and filename slugging).
+database file. Neither imports the other.
 
 ```
 Canvas --> [canvas_sync.py] --> canvas_data.db (SQLite)
@@ -50,9 +48,9 @@ Canvas --> [canvas_sync.py] --> canvas_data.db (SQLite)
        v
 External links found in synced content --> fetched directly (unauthenticated) --> same two trees, category=readings
 
-canvas_data.db + notes/ --> [notifier.py] --> Telegram
-                                  |
-                                  +--> Claude (review checklists, milestone plans)
+canvas_data.db --> [notifier.py] --> Telegram
+                        |
+                        +--> Claude (summaries, review checklists, milestone plans)
 ```
 
 - **Compute:** run manually from the command line. No cron, no CI
@@ -75,11 +73,10 @@ canvas_data.db + notes/ --> [notifier.py] --> Telegram
 
 ## 4. Data model
 
-Single SQLite file. `courses` and `items` are defined in `schema.sql`
-and written by `canvas_sync.py`. `notifications` and `milestones` are
-created by `notifier.py` itself on first run (`CREATE TABLE IF NOT
-EXISTS`), so the sync script and its schema stay usable without the
-notifier.
+Single SQLite file, four tables, all defined in `schema.sql`. Both
+scripts apply it on startup (`CREATE TABLE IF NOT EXISTS`), so either can
+run first. `canvas_sync.py` writes `courses` and `items`; `notifier.py`
+only reads those and writes `notifications` and `milestones`.
 
 ```
 courses ----1:N---- items ----1:N---- notifications
@@ -182,9 +179,9 @@ students' posts. This stays local to the SQLite file and local folders,
 and is sent externally only to Anthropic (for summarization) and to
 whatever external site a reading link points to (for that link's own
 public page content) — never re-published, aggregated, or sent anywhere
-else. The notifier's new-content messages cover announcements, files,
-discussion topics and module items, not individual discussion replies,
-and go only to your own Telegram chat.
+else. The notifier sends the text of announcements, files, discussion
+topics and module items to Anthropic for summarization (not individual
+discussion replies), and its messages go only to your own Telegram chat.
 
 **Security (R7):** `fetch_external_page()` uses a plain `requests.get()`,
 never the Canvas-authenticated `SESSION` object, specifically so the
@@ -193,17 +190,18 @@ third-party host reachable from course content.
 
 ## 6. Module design — `notifier.py`
 
-**Responsibility:** read the database and `notes/`, decide what's newly
-worth telling the user, send it, and record that it was sent. Never
-touches the Canvas API.
+**Responsibility:** read the database, decide what's newly worth telling
+the user, generate the message content, send it, and record that it was
+sent. Never touches the Canvas API.
 
 | Component | Real functions | Responsibility |
 |---|---|---|
-| `NotificationLog` | `already_sent()`, `mark_sent()` | Wraps the `notifications` table. Every send path checks `already_sent()` *before* generating content (so no Claude call is wasted on something that won't be sent) and calls `mark_sent()` after the send succeeds, so a failed send is retried next run. |
-| `TelegramSender` | `send_telegram()` | The only delivery mechanism. Isolated in one function so swapping the channel (email, Discord) touches one call site. Sends plain text with no `parse_mode`, since titles and summaries come from Canvas/Claude and a stray `*` or `_` would make Telegram reject a Markdown message. |
-| `NewContentPipeline` | `notify_new_content()`, `read_note()` | R8. For announcements, files, discussions and module items, sends the jot-note `canvas_sync.py` already wrote (found by the same slug the sync used), rather than paying for a second summarization. Items with no note are skipped. |
-| `ExamCountdownPipeline` | `notify_exam_countdowns()`, `build_review_notes()` | R8. For quizzes/calendar events due within the lookahead window, fires at 10/5/2/1 days out, each threshold logged as its own `kind` so all four reminders are independent. The review checklist is generated from the course's most recently synced material, not generic advice. |
-| `MilestonePipeline` | `notify_assignment_milestones()`, `ensure_milestone_plan()`, `check_due_milestones()` | R8. Generate-once: if an assignment has no milestone rows, ask Claude for a JSON pacing plan, persist it, and announce it. Check-daily: if today matches a stored milestone date, send that reminder. |
+| `NotificationLog` | `already_sent()`, `mark_sent()` | Wraps the `notifications` table. Every send path checks `already_sent()` *before* generating content, so no Claude call is wasted on something that won't be sent. |
+| `TelegramSender` | `send_telegram()`, `deliver()` | The only delivery mechanism, isolated so swapping the channel (email, Discord) touches one place. Sends plain text with no `parse_mode`, since titles and summaries come from Canvas/Claude and a stray `*` or `_` would make Telegram reject a Markdown message. `deliver()` sends and logs in that order, so a failed send is reported, left unlogged and retried next run. |
+| `ClaudeSummarizer` | `ask_claude()` | Thin wrapper around the Messages API; every "generate text for the user" call goes through it, so model/params change in one place. The client is created lazily so `--dry-run` needs no API key. |
+| `NewContentPipeline` | `notify_new_content()` | R8. Scans `items` for announcements/files/discussions/module items with real text, skips anything under a length floor, summarizes it into jot notes, sends, logs. |
+| `ExamCountdownPipeline` | `notify_exam_countdowns()`, `build_review_notes()` | R8. For quizzes/calendar events due within the lookahead window, fires at 10/5/2/1 days out, each threshold logged as its own `kind` so all four reminders are independent. The review checklist is generated from the course's 12 most recently synced items, not generic advice. Files carry their text in `extracted_text` and everything else in `body_text` (with `extracted_text` left as an empty string), so the query selects between them explicitly rather than using `COALESCE`, which would pick the empty string and silently drop every non-file item. |
+| `MilestonePipeline` | `notify_assignment_milestones()`, `ensure_milestone_plan()`, `parse_milestone_plan()`, `check_due_milestones()` | R8. Generate-once: if an assignment has no milestone rows, ask Claude for a JSON pacing plan, validate it, persist it, and announce it. Check-daily: if today matches a stored milestone date, send that reminder. The parser tolerates a markdown code fence and rejects malformed plans before anything is written, so a bad response never leaves half a plan behind. |
 
 **First-run baseline (R9):** if the `notifications` table is empty, the
 notifier marks everything already synced as seen instead of sending it —
@@ -218,9 +216,12 @@ a pacing plan, not assignment content, and requests a JSON array of
 assignment text and asks an LLM to produce submittable output; adding
 one would be new code, not a flag flip.
 
-**Failure handling:** a Telegram error raises and aborts that run
-*before* `mark_sent()`, so nothing is recorded as sent that wasn't. An
-unparseable milestone plan is logged and skipped.
+**Failure handling:** a failed send is logged as a warning and *not*
+recorded, so nothing is marked sent that wasn't and the next run retries
+it. After three failures in a row (almost always a bad token or chat ID)
+the run stops, so a misconfiguration doesn't spend a Claude call per
+remaining item first. An unparseable milestone plan is logged and
+skipped.
 
 ## 7. Extension points
 

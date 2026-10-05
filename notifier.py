@@ -1,27 +1,34 @@
 """
 notifier.py
 ===========
-Reads canvas_data.db and the notes/ folder written by canvas_sync.py and
-sends you Telegram messages:
+Module 2 of 2. Reads canvas_data.db (written by canvas_sync.py) and:
 
-  1. new/updated content   -- the jot-note canvas_sync already wrote for it
-  2. exam/quiz countdowns  -- review checklists at 10/5/2/1 days out
-  3. assignment milestones -- a work-pacing plan (NOT the assignment itself),
-                              then a reminder on each milestone day
+  1. Sends you jot-note summaries of any new/updated content
+     (announcements, files, discussions, module items).
+  2. Sends a countdown of review reminders leading up to quizzes/exams.
+  3. For new assignments, generates a milestone plan (NOT the assignment
+     itself) and messages you at each milestone with what to work on.
 
-Nothing is sent twice: every message is logged in the `notifications` table.
-It runs only when you run it -- no scheduler.
+It never repeats a message: everything it sends is logged in the
+`notifications` table.
 
-Setup: add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to .env
-  1. Telegram -> @BotFather -> /newbot -> copy the token
-  2. Message your new bot anything, then open
-     https://api.telegram.org/bot<TOKEN>/getUpdates and copy "chat":{"id": ...}
+This script knows nothing about Canvas's API directly -- it only reads
+the shared SQLite DB. Run it by hand, any time after canvas_sync.py has run.
 
-Usage:
-    python notifier.py --dry-run         # show what WOULD be sent; sends and records nothing
-    python notifier.py                   # send. First run marks existing content as
-                                         # already seen instead of flooding you
-    python notifier.py --send-existing   # first run: really send everything already synced
+Setup
+-----
+1. pip install -r requirements.txt
+2. In .env, set ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+   - Telegram: message @BotFather -> /newbot -> copy the token. Then message
+     your new bot anything and open
+     https://api.telegram.org/bot<TOKEN>/getUpdates to find "chat":{"id": ...}
+
+Usage
+-----
+    python notifier.py --dry-run         # list what WOULD be sent; sends and records nothing
+    python notifier.py                   # send. On a first run (empty notification log)
+                                         # existing content is marked seen, not sent
+    python notifier.py --send-existing   # first run only: send the existing backlog too
 """
 
 import os
@@ -31,36 +38,30 @@ import json
 import sqlite3
 import datetime
 import argparse
+from pathlib import Path
 
 import requests
+from anthropic import Anthropic
+from dotenv import load_dotenv
 
-from canvas_sync import ask_claude, slug_for, now_iso, NOTES_DIR, DB_PATH
+load_dotenv()
 
+DB_PATH = os.environ.get("DB_PATH", "canvas_data.db")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# How far ahead to look for upcoming quizzes/exams/deadlines, and which
+# day-counts before the due date to send a review reminder.
 EXAM_COUNTDOWN_DAYS = [10, 5, 2, 1]
 LOOKAHEAD_DAYS = 21
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS notifications (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    item_id     TEXT NOT NULL,
-    kind        TEXT NOT NULL,
-    sent_at     TEXT NOT NULL,
-    message     TEXT,
-    UNIQUE(item_id, kind),
-    FOREIGN KEY (item_id) REFERENCES items(id)
-);
-CREATE TABLE IF NOT EXISTS milestones (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    item_id        TEXT NOT NULL,
-    milestone_date TEXT NOT NULL,
-    label          TEXT NOT NULL,
-    detail         TEXT,
-    FOREIGN KEY (item_id) REFERENCES items(id)
-);
-"""
+# Stop the run after this many sends in a row fail (bad token/chat id), so a
+# misconfiguration doesn't burn a Claude call per remaining item first.
+MAX_CONSECUTIVE_SEND_FAILURES = 3
+
+_client = None
+_consecutive_failures = 0
 
 
 # ---------- infra ----------
@@ -68,14 +69,27 @@ CREATE TABLE IF NOT EXISTS milestones (
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
+    with open(Path(__file__).parent / "schema.sql") as f:
+        conn.executescript(f.read())
     return conn
 
 
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
+
+
+def parse_due(due_at):
+    try:
+        return datetime.datetime.fromisoformat(due_at.replace("Z", "+00:00")).date()
+    except Exception:
+        return None
+
+
 def already_sent(conn, item_id, kind):
-    return conn.execute(
+    row = conn.execute(
         "SELECT 1 FROM notifications WHERE item_id=? AND kind=?", (item_id, kind)
-    ).fetchone() is not None
+    ).fetchone()
+    return row is not None
 
 
 def mark_sent(conn, item_id, kind, message):
@@ -88,12 +102,47 @@ def mark_sent(conn, item_id, kind, message):
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # No parse_mode: titles and summaries come from Canvas/Claude and aren't
-    # guaranteed to be valid Markdown, and a stray * or _ makes Telegram 400.
-    resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]}, timeout=15)
+    resp = requests.post(url, data={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text[:4000],   # Telegram message length limit
+        # No parse_mode: titles/summaries come from Canvas and Claude and
+        # aren't guaranteed to be valid Markdown (a stray * or _ breaks
+        # Telegram's entity parser and 400s the whole message). Plain text
+        # is unbreakable, at the cost of losing bold/italic styling.
+    }, timeout=15)
     if not resp.ok:
-        print(f"  [warn] Telegram rejected message: {resp.status_code} {resp.text}")
-    resp.raise_for_status()
+        raise requests.HTTPError(f"Telegram rejected message: {resp.status_code} {resp.text}")
+
+
+def deliver(conn, item_id, kind, msg):
+    """Sends one message and logs it. A failed send is reported and left
+    unlogged, so the next run retries it; repeated failures stop the run."""
+    global _consecutive_failures
+    try:
+        send_telegram(msg)
+    except requests.RequestException as e:
+        _consecutive_failures += 1
+        print(f"  [warn] could not send {kind} for {item_id}: {e}")
+        if _consecutive_failures >= MAX_CONSECUTIVE_SEND_FAILURES:
+            sys.exit("Too many failed sends in a row -- check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.")
+        return False
+    _consecutive_failures = 0
+    mark_sent(conn, item_id, kind, msg)
+    print(f"Sent {kind}: {item_id}")
+    return True
+
+
+def ask_claude(system, user):
+    global _client
+    if _client is None:
+        _client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    resp = _client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=800,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
 def course_label(conn, course_id):
@@ -101,61 +150,89 @@ def course_label(conn, course_id):
     return (row["course_code"] or row["name"]) if row else str(course_id)
 
 
-def parse_due(due_at):
-    try:
-        return datetime.datetime.fromisoformat(due_at.replace("Z", "+00:00")).date()
-    except Exception:
-        return None
-
-
-def read_note(item):
-    """The jot-note canvas_sync.py already wrote for this item, if any."""
-    pattern = f"{slug_for(item['id'], item['title'])}.md"
-    matches = list((NOTES_DIR / str(item["course_id"])).glob(f"*/{pattern}"))
-    if not matches:
-        return None
-    text = matches[0].read_text(encoding="utf-8")
-    return re.sub(r"\A<!--.*?-->\s*", "", text, flags=re.DOTALL).strip() or None
-
-
-# ---------- 1. new content -> the existing jot-notes ----------
+# ---------- 1. new/updated content -> jot notes ----------
 
 def notify_new_content(conn, dry_run, baseline):
     rows = conn.execute("""
         SELECT * FROM items
         WHERE type IN ('announcement','file','discussion','module_item')
+        AND (body_text != '' OR extracted_text != '')
     """).fetchall()
 
-    count = 0
+    baselined = 0
     for item in rows:
         if already_sent(conn, item["id"], "new_content"):
             continue
-        note = read_note(item)
-        if not note:
-            continue
-        count += 1
+        text = (item["extracted_text"] or item["body_text"] or "").strip()
+        if len(text) < 40:
+            continue  # too little content to bother summarizing
+
         if baseline:
+            baselined += 1
             if not dry_run:
                 mark_sent(conn, item["id"], "new_content", "(baseline: existing content, not sent)")
             continue
-        msg = (f"{course_label(conn, item['course_id'])} — new {item['type']}\n"
-               f"{item['title']}\n\n{note}\n\n{item['url'] or ''}")
         if dry_run:
             print(f"  [dry-run] new content: {item['title']}")
-        else:
-            send_telegram(msg)
-            mark_sent(conn, item["id"], "new_content", msg)
-            print(f"Sent new_content notice: {item['id']}")
+            continue
+
+        summary = ask_claude(
+            system=(
+                "You summarize university course material into concise jot notes "
+                "for a student. Use short bullet points, no preamble, no restating "
+                "the title. Focus only on the main concepts, definitions, and any "
+                "explicit action items (e.g. 'read chapter 4', 'bring calculator'). "
+                "Max 8 bullets."
+            ),
+            user=f"Title: {item['title']}\n\nContent:\n{text[:8000]}",
+        )
+        label = course_label(conn, item["course_id"])
+        msg = f"{label} — new {item['type']}\n{item['title']}\n\n{summary}\n\n{item['url'] or ''}"
+        deliver(conn, item["id"], "new_content", msg)
 
     if baseline:
         verb = "would mark" if dry_run else "marked"
-        print(f"First run: {verb} {count} existing item(s) as already seen "
-              f"(use --send-existing to send them instead).")
+        print(f"First run: {verb} {baselined} existing item(s) as already seen "
+              f"(pass --send-existing to send them instead).")
 
 
 # ---------- 2. quiz/exam countdown ----------
 
+def notify_exam_countdowns(conn, dry_run):
+    today = datetime.date.today()
+    horizon = today + datetime.timedelta(days=LOOKAHEAD_DAYS)
+
+    rows = conn.execute("""
+        SELECT * FROM items
+        WHERE type IN ('quiz', 'calendar_event')
+        AND due_at IS NOT NULL
+    """).fetchall()
+
+    for item in rows:
+        due = parse_due(item["due_at"])
+        if due is None or not (today <= due <= horizon):
+            continue
+        days_out = (due - today).days
+
+        for threshold in EXAM_COUNTDOWN_DAYS:
+            kind = f"exam_countdown:{threshold}d"
+            if days_out != threshold or already_sent(conn, item["id"], kind):
+                continue
+            if dry_run:
+                print(f"  [dry-run] countdown ({threshold}d): {item['title']}")
+                continue
+            review_notes = build_review_notes(conn, item)
+            label = course_label(conn, item["course_id"])
+            msg = (f"{label} — {item['title']} in {threshold} day(s)\n\n"
+                   f"{review_notes}\n\n{item['url'] or ''}")
+            deliver(conn, item["id"], kind, msg)
+
+
 def build_review_notes(conn, exam_item):
+    """Pulls recent content from the same course to build a review checklist."""
+    # Files carry their text in extracted_text; everything else (announcements,
+    # module pages) carries it in body_text, with extracted_text left as ''.
+    # COALESCE would pick that empty string, so choose explicitly.
     related = conn.execute("""
         SELECT title,
                CASE WHEN extracted_text != '' THEN extracted_text ELSE body_text END AS text
@@ -179,42 +256,38 @@ def build_review_notes(conn, exam_item):
     )
 
 
-def notify_exam_countdowns(conn, dry_run):
-    today = datetime.date.today()
-    horizon = today + datetime.timedelta(days=LOOKAHEAD_DAYS)
-    rows = conn.execute("""
-        SELECT * FROM items
-        WHERE type IN ('quiz', 'calendar_event') AND due_at IS NOT NULL
-    """).fetchall()
-
-    for item in rows:
-        due = parse_due(item["due_at"])
-        if not due or not (today <= due <= horizon):
-            continue
-        days_out = (due - today).days
-        for threshold in EXAM_COUNTDOWN_DAYS:
-            kind = f"exam_countdown:{threshold}d"
-            if days_out != threshold or already_sent(conn, item["id"], kind):
-                continue
-            if dry_run:
-                print(f"  [dry-run] countdown ({threshold}d): {item['title']}")
-                continue
-            msg = (f"{course_label(conn, item['course_id'])} — {item['title']} in {threshold} day(s)\n\n"
-                   f"{build_review_notes(conn, item)}\n\n{item['url'] or ''}")
-            send_telegram(msg)
-            mark_sent(conn, item["id"], kind, msg)
-            print(f"Sent exam countdown ({threshold}d): {item['id']}")
-
-
 # ---------- 3. assignment milestone plans ----------
 
+def notify_assignment_milestones(conn, dry_run):
+    assignments = conn.execute("""
+        SELECT * FROM items WHERE type = 'assignment' AND due_at IS NOT NULL
+    """).fetchall()
+
+    for a in assignments:
+        ensure_milestone_plan(conn, a, dry_run)
+        check_due_milestones(conn, a, dry_run)
+
+
+def parse_milestone_plan(raw):
+    """Parses Claude's JSON plan into [(days_before_due, label, detail)], or
+    None if it isn't the expected shape. Tolerates a markdown code fence."""
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+    try:
+        plan = json.loads(raw)
+        return [(int(m["days_before_due"]), str(m["label"]), str(m.get("detail", ""))) for m in plan]
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def ensure_milestone_plan(conn, assignment, dry_run):
-    if conn.execute("SELECT 1 FROM milestones WHERE item_id=?", (assignment["id"],)).fetchone():
+    exists = conn.execute("SELECT 1 FROM milestones WHERE item_id=?", (assignment["id"],)).fetchone()
+    if exists:
         return
     due = parse_due(assignment["due_at"])
-    if not due:
+    if due is None:
         return
-    days_available = (due - datetime.date.today()).days
+    today = datetime.date.today()
+    days_available = (due - today).days
     if days_available < 1:
         return
     if dry_run:
@@ -235,65 +308,66 @@ def ensure_milestone_plan(conn, assignment, dry_run):
         user=f"Assignment: {assignment['title']}\nDescription: {(assignment['body_text'] or '')[:3000]}\n"
              f"Days available: {days_available}",
     )
-    plan_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", plan_json.strip())
-    try:
-        milestones = json.loads(plan_json)
-    except json.JSONDecodeError:
+    milestones = parse_milestone_plan(plan_json)
+    if not milestones:
         print(f"  [warn] could not parse milestone plan for {assignment['id']}")
         return
 
-    for m in milestones:
-        m_date = due - datetime.timedelta(days=int(m["days_before_due"]))
+    # Insert only after the whole plan parsed, so a malformed plan never
+    # leaves a half-written set of milestones behind.
+    for days_before, label, detail in milestones:
+        m_date = due - datetime.timedelta(days=days_before)
         conn.execute(
             "INSERT INTO milestones (item_id, milestone_date, label, detail) VALUES (?,?,?,?)",
-            (assignment["id"], m_date.isoformat(), m["label"], m["detail"]),
+            (assignment["id"], m_date.isoformat(), label, detail),
         )
     conn.commit()
 
-    plan_lines = "\n".join(f"- {m['days_before_due']}d before: {m['label']}" for m in milestones)
-    msg = (f"{course_label(conn, assignment['course_id'])} — plan created for {assignment['title']}\n"
+    course = course_label(conn, assignment["course_id"])
+    plan_lines = "\n".join(f"- {d}d before: {label}" for d, label, _ in milestones)
+    msg = (f"{course} — plan created for {assignment['title']}\n"
            f"Due {assignment['due_at']}\n\n{plan_lines}\n\n"
-           f"I'll message you on each milestone day.")
-    send_telegram(msg)
-    mark_sent(conn, assignment["id"], "milestone_plan_created", msg)
+           f"I'll ping you on each milestone day. Want help thinking through any part "
+           f"of it now, just ask.")
+    deliver(conn, assignment["id"], "milestone_plan_created", msg)
 
 
 def check_due_milestones(conn, assignment, dry_run):
     today = datetime.date.today().isoformat()
-    for m in conn.execute(
-        "SELECT * FROM milestones WHERE item_id=? AND milestone_date=?", (assignment["id"], today)
-    ).fetchall():
+    milestones = conn.execute(
+        "SELECT * FROM milestones WHERE item_id=? AND milestone_date=?",
+        (assignment["id"], today),
+    ).fetchall()
+    for m in milestones:
         kind = f"assignment_milestone:{m['id']}"
         if already_sent(conn, assignment["id"], kind):
             continue
         if dry_run:
             print(f"  [dry-run] milestone today: {assignment['title']} / {m['label']}")
             continue
-        msg = (f"{course_label(conn, assignment['course_id'])} — milestone today: {assignment['title']}\n\n"
-               f"{m['label']}\n{m['detail']}\n\nDue {assignment['due_at']}")
-        send_telegram(msg)
-        mark_sent(conn, assignment["id"], kind, msg)
-        print(f"Sent milestone reminder: {assignment['id']} / {m['label']}")
-
-
-def notify_assignment_milestones(conn, dry_run):
-    for a in conn.execute("SELECT * FROM items WHERE type = 'assignment' AND due_at IS NOT NULL").fetchall():
-        ensure_milestone_plan(conn, a, dry_run)
-        check_due_milestones(conn, a, dry_run)
+        label = course_label(conn, assignment["course_id"])
+        msg = (f"{label} — milestone today: {assignment['title']}\n\n"
+               f"{m['label']}\n{m['detail']}\n\n"
+               f"Due {assignment['due_at']}")
+        deliver(conn, assignment["id"], kind, msg)
 
 
 # ---------- main ----------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="show what would be sent; send and record nothing")
+    parser = argparse.ArgumentParser(description="Send Telegram notifications from the synced Canvas data.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="list what would be sent; send and record nothing")
     parser.add_argument("--send-existing", action="store_true",
                         help="on a first run, send already-synced content instead of marking it seen")
     args = parser.parse_args()
 
-    if not args.dry_run and not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        sys.exit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env first (see the top of this file), "
-                 "or use --dry-run.")
+    if not args.dry_run:
+        missing = [name for name, value in (("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+                                            ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+                                            ("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)) if not value]
+        if missing:
+            sys.exit(f"Set {', '.join(missing)} in .env first (see the top of this file), or use --dry-run.")
 
     conn = get_db()
     first_run = conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 0
